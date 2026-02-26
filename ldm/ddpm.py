@@ -15,7 +15,7 @@ from torchvision.utils import make_grid, save_image
 from torch import clamp
 import SimpleITK as sitk
 import torch.fft as fft
-import torch.functional as F
+import torch.nn.functional as F
 from PIL import Image
 from monai.transforms import SaveImage
 
@@ -31,6 +31,8 @@ from .ddpm_utils import make_beta_schedule, extract_into_tensor, noise_like
 from .ddim import DDIMSampler
 from .Medicalnet.Vit import load_weight_for_vit_encoder, vit_encoder_b
 from .condition_extractor import UnetEncoder
+from .sgb import SGBModule
+from .pf_projector import DifferentiableDRRProjector
 
 
 __conditioning_keys__ = {"concat": "c_concat", "crossattn": "c_crossattn", "adm": "y"}
@@ -503,6 +505,12 @@ class LatentDiffusion(DDPM):
         scale_by_std=False,
         high_low_mode=False,
         cond_nums=[1,2],
+        use_sgb: bool = True,
+        sgb_num_heads: int = 4,
+        lambda_bsc: float = 0.0,
+        lambda_pf: float = 0.0,
+        bsc_dim: int = 128,
+        pf_config=None,
         *args,
         **kwargs,
     ):
@@ -536,6 +544,28 @@ class LatentDiffusion(DDPM):
         self.bbox_tokenizer = None
         self.high_low_mode = high_low_mode
         self.cond_nums = cond_nums
+        self.use_sgb = bool(use_sgb)
+        self.lambda_bsc = float(lambda_bsc)
+        self.lambda_pf = float(lambda_pf)
+
+        # Defaults based on current conditioner heads (fc outputs 8 channels).
+        self.cond_feat_dim = int(getattr(cond_stage_config, "cond_feat_dim", 8))
+        self.sgb = SGBModule(
+            embed_dim=self.cond_feat_dim,
+            num_heads=int(sgb_num_heads),
+            target_d=int(self.image_size),
+            target_hw=int(self.image_size),
+        )
+
+        cond_channels = int(self.cond_feat_dim) * int(len(self.cond_nums))
+        self.bsc_proj_c = nn.Conv3d(cond_channels, int(bsc_dim), kernel_size=1)
+        self.bsc_proj_z = nn.Conv3d(int(self.channels), int(bsc_dim), kernel_size=1)
+
+        pf_config = {} if pf_config is None else dict(pf_config)
+        self.pf_projector = DifferentiableDRRProjector(
+            axes=tuple(pf_config.get("axes", (2, 4))),
+            normalize=str(pf_config.get("normalize", "zscore")),
+        )
 
         self.cond1_order = list(cond_stage_config.cond1_order)
         self.cond2_order = list(cond_stage_config.cond2_order)
@@ -728,8 +758,23 @@ class LatentDiffusion(DDPM):
         """
         # * repeat second channel
         cond = cond.repeat(1, 3, 1, 1)
-        cond = self.cond_stage_model(cond)
-        return cond
+        feat = self.cond_stage_model(cond)
+
+        # Some conditioners in this repo already "broadcast" to 3D; we explicitly avoid relying on that.
+        if feat.dim() == 5:
+            feat2d = feat[..., 0]
+        else:
+            feat2d = feat
+
+        if feat2d.shape[-2:] != (self.image_size, self.image_size):
+            feat2d = F.interpolate(feat2d, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+
+        if self.use_sgb:
+            return self.sgb(feat2d)
+
+        # Fallback: legacy broadcasting to 3D.
+        d = int(self.image_size)
+        return feat2d.unsqueeze(-1).repeat(1, 1, 1, 1, d)
 
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
@@ -829,7 +874,6 @@ class LatentDiffusion(DDPM):
 
         return fold, unfold, normalization, weighting
 
-    @torch.no_grad()
     def get_input(
         self,
         batch,
@@ -860,8 +904,9 @@ class LatentDiffusion(DDPM):
         if bs is not None:
             x = x[:bs]
         x = x.to(self.device)
-        encoder_posterior = self.encode_first_stage(x)
-        z = self.get_first_stage_encoding(encoder_posterior).detach()  # *  input image -> first stage -> sample -> z
+        with torch.no_grad():
+            encoder_posterior = self.encode_first_stage(x)
+            z = self.get_first_stage_encoding(encoder_posterior).detach()  # *  input image -> first stage -> sample -> z
 
         cond = [cond1, cond2,cond3]
         
@@ -894,8 +939,12 @@ class LatentDiffusion(DDPM):
             xrec = self.decode_first_stage(z)
             out.extend([x, xrec])
         if return_original_cond:
-            # out.append(cond)
-            out.extend(cond)
+            if 1 in self.cond_nums:
+                out.append(cond1)
+            if 2 in self.cond_nums:
+                out.append(cond2)
+            if 3 in self.cond_nums:
+                out.append(cond3)
         return out
 
     @torch.no_grad()
@@ -1060,11 +1109,27 @@ class LatentDiffusion(DDPM):
             return self.first_stage_model.encode(x)
 
     def shared_step(self, batch, **kwargs):
-        x, c = self.get_input(batch, self.first_stage_key)  # * x: fisrt_stage gauss sample  ,c origin image
-        loss = self(x, c)
+        if self.lambda_pf > 0.0:
+            out = self.get_input(batch, self.first_stage_key, return_original_cond=True)
+            x, c = out[0], out[1]
+            xray_targets = {}
+            idx = 2
+            if 1 in self.cond_nums:
+                xray_targets["cond1"] = out[idx]
+                idx += 1
+            if 2 in self.cond_nums:
+                xray_targets["cond2"] = out[idx]
+                idx += 1
+            if 3 in self.cond_nums:
+                xray_targets["cond3"] = out[idx]
+                idx += 1
+            loss = self(x, c, xray_targets=xray_targets)
+        else:
+            x, c = self.get_input(batch, self.first_stage_key)  # * x: first_stage gauss sample, c: conditioning features
+            loss = self(x, c)
         return loss, c
 
-    def forward(self, x, c, *args, **kwargs):
+    def forward(self, x, c, xray_targets=None, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         # if self.model.conditioning_key is not None:
         #     assert c is not None
@@ -1073,7 +1138,7 @@ class LatentDiffusion(DDPM):
         #     if self.shorten_cond_schedule:  # TODO: drop this option
         #         tc = self.cond_ids[t].to(self.device)
         #         c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))  # * c -> c_tc(noisy)
-        return self.p_losses(x, c, t, *args, **kwargs)
+        return self.p_losses(x, c, t, *args, xray_targets=xray_targets, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -1214,7 +1279,7 @@ class LatentDiffusion(DDPM):
         kl_prior = normal_kl(mean1=qt_mean, logvar1=qt_log_variance, mean2=0.0, logvar2=0.0)
         return mean_flat(kl_prior) / np.log(2.0)
 
-    def p_losses(self, x_start, cond, t, noise=None):
+    def p_losses(self, x_start, cond, t, noise=None, xray_targets=None):
         noise = default(noise, lambda: torch.randn_like(x_start))  # * [64,64,4,4,4]
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)  # * x -> x_t (noisey)
         model_output = self.apply_model(x_noisy, t, cond)
@@ -1246,6 +1311,44 @@ class LatentDiffusion(DDPM):
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f"{prefix}/loss_vlb": loss_vlb})
         loss += self.original_elbo_weight * loss_vlb
+
+        # --- Biomedical Semantic Consistency loss (latent cosine distance) ---
+        if self.lambda_bsc > 0.0:
+            c3d = cond
+            z3d = x_start
+            vc = self.bsc_proj_c(c3d).mean(dim=(2, 3, 4))
+            vz = self.bsc_proj_z(z3d).mean(dim=(2, 3, 4))
+            bsc = 1.0 - F.cosine_similarity(vc, vz, dim=1)
+            l_bsc = bsc.mean()
+            loss = loss + self.lambda_bsc * l_bsc
+            loss_dict.update({f"{prefix}/loss_bsc": l_bsc})
+
+        # --- Physical Fidelity loss (differentiable projection vs input x-rays) ---
+        if self.lambda_pf > 0.0:
+            if not xray_targets:
+                raise ValueError("lambda_pf > 0 but xray_targets is missing/empty. Provide x-ray tensors from the batch.")
+
+            if self.parameterization == "eps":
+                x0_pred = self.predict_start_from_noise(x_noisy, t=t, noise=model_output)
+            else:
+                x0_pred = model_output
+
+            vol_pred = self.differentiable_decode_first_stage(x0_pred)
+
+            # Pick target resolution from the first available view
+            first_view = next(iter(xray_targets.values()))
+            target_hw = tuple(first_view.shape[-2:])
+            projs = self.pf_projector(vol_pred, target_hw=target_hw)
+
+            pf_terms = []
+            view_keys = list(xray_targets.keys())
+            for p, k in zip(projs, view_keys):
+                y = xray_targets[k]
+                pf_terms.append(F.mse_loss(p, y))
+            l_pf = torch.stack(pf_terms).mean()
+            loss = loss + self.lambda_pf * l_pf
+            loss_dict.update({f"{prefix}/loss_pf": l_pf})
+
         loss_dict.update({f"{prefix}/loss": loss})
 
         return loss, loss_dict
@@ -1706,6 +1809,10 @@ class LatentDiffusion(DDPM):
     def configure_optimizers(self):
         lr = self.learning_rate
         params = list(self.model.parameters())
+        # Train SGB + auxiliary heads even if cond backbone is frozen.
+        params += list(self.sgb.parameters())
+        params += list(self.bsc_proj_c.parameters())
+        params += list(self.bsc_proj_z.parameters())
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())

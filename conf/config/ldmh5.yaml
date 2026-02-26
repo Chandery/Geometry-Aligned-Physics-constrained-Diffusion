@@ -17,7 +17,7 @@ ct_channel: 128
 xray_channel: 1
  
 train_datasetfile: "./data/train.txt"
-val_datasetfile: "./data/test.txt"   #"/disk/cc/Xray-Diffusion/data/val.txt"
+val_datasetfile: "./data/val.txt"   #"/disk/cc/Xray-Diffusion/data/val.txt"
 
 test_datasetfile: "./data/test.txt"
   
@@ -38,6 +38,13 @@ latent_diffusion:
   high_low_mode: False
   cond_nums: [1,2]   #[1,2,3]
   batch_size: ${config.batch_size}
+  use_sgb: true
+  sgb_num_heads: 4
+  lambda_bsc: 0.1
+  lambda_pf: 0.1
+  pf_config:
+    axes: [2, 4]
+    normalize: "zscore"
 
 
   log_every_t: 200

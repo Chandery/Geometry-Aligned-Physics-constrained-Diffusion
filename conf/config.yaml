@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - config: img2img
+  - config: ldm
 
 hydra:
   run:
